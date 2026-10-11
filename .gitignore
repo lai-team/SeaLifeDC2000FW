@@ -1,0 +1,13 @@
+# Vendor firmware images - proprietary, not redistributed here.
+FPUPDATE.DAT
+*.DAT
+
+# Everything sunp_tool.py produces; fully reproducible from the firmware image.
+unpacked/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
