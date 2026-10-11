@@ -215,6 +215,62 @@ def sst_decode(d):
 # record wrappers
 # --------------------------------------------------------------------------
 
+def tlv_blocks(payload):
+    """Split a record payload into its `tag + u32 size` sub-blocks.
+
+    Every 0x18ce record checked is fully consumed by this, with tags PAR0
+    (parameters) and DAT0 (the table itself). Returns None if the payload
+    does not tile exactly, so partial parses are never presented as complete.
+    """
+    out, o = [], 0
+    while o + 8 <= len(payload):
+        tag = payload[o:o + 4]
+        size = u32(payload, o + 8 - 4)
+        if not all(32 <= c < 127 for c in tag) or o + 8 + size > len(payload):
+            return None
+        out.append((tag.decode("latin1"), payload[o + 8:o + 8 + size]))
+        o += 8 + size
+    return out if o == len(payload) and out else None
+
+
+USB_DT = {1: "DEVICE", 2: "CONFIGURATION", 3: "STRING", 4: "INTERFACE",
+          5: "ENDPOINT", 7: "DEVICE_QUALIFIER", 11: "INTERFACE_ASSOCIATION",
+          0x21: "HID", 0x24: "CS_INTERFACE", 0x25: "CS_ENDPOINT"}
+USB_CLASS = {0x01: "Audio", 0x0E: "Video", 0x08: "Mass Storage",
+             0x06: "Still Image", 0x03: "HID", 0xEF: "Misc"}
+
+
+def usb_descriptors(d):
+    """Walk a USB configuration descriptor set. Returns [(offset, text)]."""
+    out, o = [], 0
+    while o < len(d):
+        ln = d[o]
+        if ln < 2 or o + ln > len(d):
+            break
+        t = d[o + 1]
+        name = USB_DT.get(t, f"0x{t:02x}")
+        extra = ""
+        if t == 2 and ln >= 9:
+            extra = (f" wTotalLength={d[o+2] | d[o+3] << 8} "
+                     f"bNumInterfaces={d[o+4]} bMaxPower={d[o+8]*2}mA")
+        elif t == 4 and ln >= 9:
+            cls = USB_CLASS.get(d[o + 5], f"0x{d[o+5]:02x}")
+            extra = (f" bInterfaceNumber={d[o+2]} bAlternateSetting={d[o+3]} "
+                     f"bNumEndpoints={d[o+4]} class={cls}"
+                     f"/0x{d[o+6]:02x}/0x{d[o+7]:02x}")
+        elif t == 5 and ln >= 7:
+            extra = (f" bEndpointAddress=0x{d[o+2]:02x} "
+                     f"bmAttributes=0x{d[o+3]:02x} "
+                     f"wMaxPacketSize={d[o+4] | d[o+5] << 8}")
+        elif t == 11 and ln >= 8:
+            cls = USB_CLASS.get(d[o + 4], f"0x{d[o+4]:02x}")
+            extra = (f" bFirstInterface={d[o+2]} bInterfaceCount={d[o+3]} "
+                     f"function={cls}/0x{d[o+5]:02x}/0x{d[o+6]:02x}")
+        out.append((o, f"len={ln:<3} {name}{extra}"))
+        o += ln
+    return out, o
+
+
 def unwrap(d):
     """Strip an 8- or 16-byte record wrapper. Returns (info, payload) or None."""
     if len(d) < 8:
@@ -222,11 +278,11 @@ def unwrap(d):
     kind = u16(d, 2)
     if kind == REC_8:
         size = u16(d, 6)
-        if 8 + size <= len(d):
+        if 0 < size and 8 + size <= len(d):
             return {"wrapper": "0x18ba", "tag": u16(d, 0), "size": size}, d[8:8 + size]
     elif kind == REC_16 and len(d) >= 16:
         size = u32(d, 8)
-        if 16 + size <= len(d):
+        if 0 < size and 16 + size <= len(d):
             return ({"wrapper": "0x18ce", "tag": u16(d, 0), "size": size,
                      "checksum": f"0x{u32(d, 12):08x}",
                      "sub": d[16:20].decode("latin1", "replace")}, d[16:16 + size])
@@ -326,12 +382,40 @@ def extract(data, name, outdir, census, depth=0):
                 f.write(f"{sid}\t{text}\n")
         return
 
+    if data[:2] == b"\x09\x02":
+        descs, used = usb_descriptors(data)
+        if descs:
+            with open(os.path.join(outdir, name + ".usb.txt"), "w") as f:
+                f.write(f"# {name}: {len(descs)} descriptors, "
+                        f"{used}/{len(data)} bytes consumed\n")
+                for off, line in descs:
+                    f.write(f"+0x{off:04x}  {line}\n")
+            return
+
     w = unwrap(data)
-    if w and depth == 0:
+    if w:
         info, payload = w
-        with open(os.path.join(outdir, name + ".payload"), "wb") as f:
-            f.write(payload)
-        return
+        blocks = tlv_blocks(payload)
+        if blocks:
+            sub = os.path.join(outdir, name + ".d")
+            os.makedirs(sub, exist_ok=True)
+            with open(os.path.join(sub, "_record.txt"), "w") as f:
+                f.write(f"# {name}: {info['wrapper']} wrapper, "
+                        f"tag=0x{info['tag']:04x}, payload={info['size']}\n")
+                if "checksum" in info:
+                    f.write(f"# header checksum field {info['checksum']} "
+                            "(algorithm unidentified; nothing in the firmware "
+                            "appears to verify it)\n")
+                for tag, blob in blocks:
+                    f.write(f"{tag}\t{len(blob)}\n")
+            for i, (tag, blob) in enumerate(blocks):
+                with open(os.path.join(sub, f"{i:02d}_{tag}.bin"), "wb") as f:
+                    f.write(blob)
+            return
+        if depth == 0:
+            with open(os.path.join(outdir, name + ".payload"), "wb") as f:
+                f.write(payload)
+            return
 
     if depth:                       # archive member with no decoder: keep it
         with open(os.path.join(outdir, name), "wb") as f:
@@ -380,6 +464,39 @@ def cmd_extract(args):
         print(f"  {n:>4}  {k}")
 
 
+def cmd_embedded(args):
+    """Find FIF1 archives compiled into a raw section (e.g. the main firmware)."""
+    d = open(args.target, "rb").read()
+    census, found = {}, 0
+    pos = 0
+    while True:
+        i = d.find(b"FIF1", pos)
+        if i < 0:
+            break
+        pos = i + 4
+        if i < 8 or u16(d, i - 6) != FIF1_WRAPPER:
+            continue
+        count = u32(d, i + 4)
+        if not 0 < count <= 128:
+            continue
+        blob = d[i - 8:]
+        try:
+            ents = fif1_entries(blob)
+        except (struct.error, IndexError):
+            continue
+        if not all(e[0] and all(32 <= c < 127 for c in e[0].encode()) for e in ents):
+            continue
+        found += 1
+        label = f"fif1_{i - 8:08x}"
+        print(f"@0x{i - 8:08x}  {count} members")
+        out = os.path.join(args.output, label)
+        for mname, msize, moff, mdata in ents:
+            extract(mdata, mname, out, census, depth=1)
+    print(f"\n{found} embedded archive(s) -> {args.output}/")
+    for k, n in sorted(census.items(), key=lambda kv: -kv[1]):
+        print(f"  {n:>4}  {k}")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -391,6 +508,11 @@ def main():
     p.add_argument("target")
     p.add_argument("-o", "--output", default="assets")
     p.set_defaults(func=cmd_extract)
+    p = sub.add_parser("embedded",
+                       help="extract FIF1 archives compiled into a raw section")
+    p.add_argument("target")
+    p.add_argument("-o", "--output", default="embedded")
+    p.set_defaults(func=cmd_embedded)
     args = ap.parse_args()
     args.func(args)
 

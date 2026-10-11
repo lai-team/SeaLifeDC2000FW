@@ -5,6 +5,7 @@ FPUPDATE.DAT
 # Everything the tools produce; fully reproducible from the firmware image.
 unpacked/
 assets/
+embedded/
 
 # Python
 __pycache__/

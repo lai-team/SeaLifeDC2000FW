@@ -76,6 +76,7 @@ one of a handful of iCatch/Sunplus formats, and they nest.
 ```
 sunp_assets.py identify unpacked/files/A/RO_RES
 sunp_assets.py extract  unpacked/files/A/RO_RES -o assets
+sunp_assets.py embedded unpacked/sections/06_mainfw.bin -o embedded
 ```
 
 Of 259 files, 256 are identified; `extract` recursively unpacks the archives
@@ -129,27 +130,82 @@ strn:  u16 language id, u16 unknown, u16 count,
 
 `ENGLISH.SST` holds 914 entries; id 0 is `Language`, id 1 is `English`.
 
-### Record wrappers
+### Record wrappers and their sub-blocks
 
 Single tuning tables are wrapped in a small header, two variants:
 
 ```
 0x18ba:  u16 tag, u16 0x18ba, u16 flags, u16 payload size          (8 bytes)
 0x18ce:  u16 tag, u16 0x18ce, u16 flags, u16 ?, u32 payload size,
-         u32 checksum                                              (16 bytes)
+         u32 checksum field                                        (16 bytes)
 ```
 
-The `0x18ce` payload often begins with a `DAT0` sub-block. The checksum is
-unverified — the algorithm has not been identified, so the tool does not
-recompute it. Editing a `0x18ce` record may therefore need the checksum fixed
-before the camera accepts it.
+The payload is itself a `char[4] tag + u32 size` TLV. All 46 `0x18ce` records
+in the image are consumed exactly by it, using two tags: `PAR0` (parameters,
+31 records) and `DAT0` (the table itself, 46). The firmware's own IQ dump
+routine references both, next to a `D:\DUMP%d\%s.BIN` format string.
+
+**On the checksum field:** it is *not* CRC-32. Ruled out by sweeping poly,
+init, reflection and xorout across a catalogue of 32-bit CRCs plus FNV, djb2,
+sdbm, Jenkins and Adler, over the payload, the whole record, and every
+sub-range of the smallest record. A standard reflected CRC-32 table does exist
+at `mainfw+0xa43f18`, but no range reproduces the field.
+
+More usefully, **nothing appears to verify it**. Every `checkSum`/CRC string in
+either MIPS blob belongs to NAND reserved-block headers, eMMC boot areas, the
+DRAM parameter area or the SD/SDIO layer — none to these records. So editing a
+tuning record probably does not require fixing the field. That is inference
+from strings, not proof from disassembly; treat it as likely rather than
+certain. Records with identical payloads do share the value, but since those
+are byte-identical copies that is equally consistent with a content hash or an
+authoring-tool tag.
+
+### Archives compiled into the firmware
+
+The main firmware carries four more `FIF1` archives of fallback resources,
+used when the volume copies are missing:
+
+```
+sunp_assets.py embedded unpacked/sections/06_mainfw.bin -o embedded
+```
+
+| Offset | Members |
+|---|---|
+| `0x00879c80` | `AGC.BIN`, `EXPOSURE.BIN` |
+| `0x0087e520` | `DISPGAM0`, `DISPGAMA`, `DISPMAX`, `NTSCMAX`, `PALMAX` |
+| `0x0087ec40` | `AALUT`, `CDSP6350`, `EDGEGLUT`, `HSC` |
+| `0x0087f1e0` | `BEEP1.WAV`, `SHUTTER1.WAV` |
+
+### Other decoded pieces
+
+`USBUVC.BIN` is a raw USB configuration descriptor set, decoded by the tool to
+a readable listing: a composite device exposing a **UVC webcam** (two video
+streaming interfaces, 7 bandwidth alt-settings each) plus a **UAC audio**
+function, 100 mA bus powered.
+
+`LT_DPC.BIN` is a plain-text key/timing script (`<JOB> MSG = MSG_KEY_RIGHT
+TIME = 1000ms </JOB>`, wrapped in `<LOP CNT=10000>`) — a factory life-test
+sequence driving the camera's own key events.
+
+The `DRAMPAR1` section holds four blocks. Three of them are DRAM timing
+profiles: after a 4-byte block header, a flat list of `u16 register, u8 value`
+writes over the `0x70xx` controller space (`0x7050=0xa0`, `0x7054=0x2a`, …),
+95–98% of addresses landing in plausible register ranges. The fourth and
+largest block writes a different space (`0x00xx`/`0x02xx`) and its framing is
+less certain.
 
 ### Still opaque
 
-The `FDL` fonts (`FDL Font` magic) are a third-party outline format. The
-contents of most IQ tables are raw coefficient arrays whose field meanings are
-unknown — the tool extracts them but cannot interpret them. `AECFG.BIN` (63 B)
-and `AWBCTT.BIN` (80 B) are small unwrapped tables of unclear layout.
+- **`FDL` fonts** (8 files, `FDL Font` magic) — a third-party CJK/Thai outline
+  format. Not decoded.
+- **IQ coefficient arrays** — extracted as `DAT0`/`PAR0` blocks, but the field
+  meanings inside are unknown. The `3DLUT*` tables are 760 four-byte entries
+  whose fourth byte is always zero, i.e. RGB triplets padded to 4 bytes; the
+  lattice geometry did not resolve (760 is not a cube, and a 124-byte header
+  before a 9³ grid fits the arithmetic but is not supported by the data —
+  these are stylised art LUTs, so smoothness cannot discriminate).
+- **The `0x18ce` checksum algorithm**, as above.
+- `AECFG.BIN` (63 B) and `AWBCTT.BIN` (80 B) — small unwrapped tables.
 
 Notably, `BADPIX.BIN`, `DEFPIX1.BIN`, `DEFTPXL0.BIN` and `DEFTPXL1.BIN` ship
 entirely blank — they are four of the seven files HDR 3 preserves, so the real
