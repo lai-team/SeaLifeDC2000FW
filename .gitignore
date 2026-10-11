@@ -2,8 +2,9 @@
 FPUPDATE.DAT
 *.DAT
 
-# Everything sunp_tool.py produces; fully reproducible from the firmware image.
+# Everything the tools produce; fully reproducible from the firmware image.
 unpacked/
+assets/
 
 # Python
 __pycache__/

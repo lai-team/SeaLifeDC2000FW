@@ -68,6 +68,93 @@ asserts the result is byte-identical to the input.
 
 Python 3.8+, no dependencies.
 
+## Resource formats (`sunp_assets.py`)
+
+The resource volume is not a pile of opaque `.BIN` blobs — nearly all of it is
+one of a handful of iCatch/Sunplus formats, and they nest.
+
+```
+sunp_assets.py identify unpacked/files/A/RO_RES
+sunp_assets.py extract  unpacked/files/A/RO_RES -o assets
+```
+
+Of 259 files, 256 are identified; `extract` recursively unpacks the archives
+and decodes sprite sheets to PNG and string tables to text.
+
+| Format | Files | Status |
+|---|---|---|
+| RIFF `SPFN` sprite sheets (`.SFN`) | 66 | decoded → PNG + glyph index |
+| UTF-16 / plain text (`.txt`, `LT_DPC.BIN`) | 67 | plain text already |
+| RIFF `SPST` string tables (`.SST`) | 32 | decoded → `id<TAB>text` |
+| JPEG | 32 | standard |
+| Record wrapper `0x18ce` / `0x18ba` | 35 | header parsed, payload extracted |
+| `FIF1` archives | 8 | decoded → member files |
+| `FDL Font` (CJK/Thai outlines) | 8 | third-party, **not decoded** |
+| Blank calibration placeholders | 4 | all-`0x00`/`0xFF` |
+| RIFF/WAVE, USB descriptors | 4 | standard |
+
+### `FIF1` archive
+
+8-byte wrapper, then `FIF1`, `u32 count`, then `count` records of
+`char[12] name` + `u32 size`. Member payloads follow, each 16-byte aligned.
+Some archives (BOOTIQ, BOOTLIQ) place an all-zero 16-byte terminator after the
+name table and others do not, so the tool detects it rather than assuming.
+
+Members are the ISP tuning sets (`3DLUT*`, `RGAMA*`, `WDR*`, `YGAMMA*`, …),
+the face-detection databases (`FDDB` magic), and the UI defaults.
+
+### RIFF `SPFN` sprite sheets
+
+Standard RIFF with chunks `mark`, `fshp`, `fplt`, `comp`, `dsgn`.
+
+```
+fshp:  u16 width, u16 height, u16 flags (low byte = bits per pixel),
+       u32 bytes-per-glyph, u16 glyph count,
+       then per glyph: u16 charcode, u16 advance width, height*stride rows
+       bytes-per-glyph == 4 + stride*height   (reproduces every chunk size)
+fplt:  u16 colour count, then count*3 bytes RGB
+```
+
+Pixel values index the palette; index 0 is transparent in every sheet checked
+(the icons are drawn over live video), and palette entry 0 holds a non-colour
+marker `#800000`. Fonts carry real charcodes — `ENGSMALL.SFN` is a 76-glyph
+proportional ASCII font, `D28X44.SFN` the monospaced date-stamp digits.
+
+### RIFF `SPST` string tables
+
+```
+strn:  u16 language id, u16 unknown, u16 count,
+       then per string: u16 id, u16 byte length, UTF-16LE (no terminator)
+```
+
+`ENGLISH.SST` holds 914 entries; id 0 is `Language`, id 1 is `English`.
+
+### Record wrappers
+
+Single tuning tables are wrapped in a small header, two variants:
+
+```
+0x18ba:  u16 tag, u16 0x18ba, u16 flags, u16 payload size          (8 bytes)
+0x18ce:  u16 tag, u16 0x18ce, u16 flags, u16 ?, u32 payload size,
+         u32 checksum                                              (16 bytes)
+```
+
+The `0x18ce` payload often begins with a `DAT0` sub-block. The checksum is
+unverified — the algorithm has not been identified, so the tool does not
+recompute it. Editing a `0x18ce` record may therefore need the checksum fixed
+before the camera accepts it.
+
+### Still opaque
+
+The `FDL` fonts (`FDL Font` magic) are a third-party outline format. The
+contents of most IQ tables are raw coefficient arrays whose field meanings are
+unknown — the tool extracts them but cannot interpret them. `AECFG.BIN` (63 B)
+and `AWBCTT.BIN` (80 B) are small unwrapped tables of unclear layout.
+
+Notably, `BADPIX.BIN`, `DEFPIX1.BIN`, `DEFTPXL0.BIN` and `DEFTPXL1.BIN` ship
+entirely blank — they are four of the seven files HDR 3 preserves, so the real
+per-unit calibration lives only on the camera and is restored over these.
+
 ## The platform
 
 | | |
