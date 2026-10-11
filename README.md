@@ -1,47 +1,70 @@
 # SeaLife DC2000 firmware tooling
 
-`sunp_tool.py` unpacks and repacks iCatch **"SUNP BURN FILE"** camera firmware
-images — the `FPUPDATE.DAT` files these cameras read off an SD card to update
-themselves.
+`sunp_tool.py` unpacks, repacks and patches iCatch **"SUNP BURN FILE"** camera
+firmware images — the `FPUPDATE.DAT` files these cameras read off an SD card to
+update themselves.
 
 Developed against the SeaLife DC2000 image
 `sha256:9beffb33d8b930da160aeb5443b94089881d97128da2d17402b4edb3afbe61ed`
-(47,739,310 bytes). **The firmware image itself is not included in this repo** —
-it's SeaLife's, and it embeds third-party code (a signed MAGIX installer, a
-Broadcom Wi-Fi blob, licensed Morpho and ArcSoft libraries). Get it from the
-vendor's firmware-update download, or off a camera.
+(47,739,310 bytes). **The firmware image itself is not in this repo** — it's
+SeaLife's, and it embeds third-party code (a signed MAGIX installer, a Broadcom
+Wi-Fi blob, licensed Morpho and ArcSoft libraries). Get it from the vendor's
+firmware-update download, or off a camera.
 
 Everything below was derived by parsing the image, not from vendor
 documentation, so treat it as an accurate description of *one* firmware rather
 than a specification.
 
-## Usage
+## Versioned modification
 
-```
-sunp_tool.py info   IMG              parse and print the container layout
-              unpack IMG [-o DIR]    split into sections + extract both FAT volumes
-              repack DIR [-o IMG]    rebuild, recomputing every offset/size field
-              ls     VOL             list a FAT volume image
-              get    VOL PATH DST    copy a file out of a FAT volume image
-              put    VOL PATH SRC    replace a file inside a FAT volume image
-```
+Because the vendor image can't be committed, modifications are tracked as a
+**pinned baseline plus a small overlay of changes**:
 
-Typical edit cycle:
+- `baseline.json` records the image's SHA-256, section layout, and a per-file
+  inventory of both volumes. Committed.
+- `overlay/` holds only what differs — replaced files, added files, deletions,
+  and byte patches. Committed. See [overlay/README.md](overlay/README.md).
+- `build` combines the two into a modified image. Deterministic: the same
+  baseline and overlay always produce the same bytes, so a given commit
+  identifies an exact firmware image without the image being in git.
 
 ```sh
-./sunp_tool.py unpack FPUPDATE.DAT -o unpacked
-./sunp_tool.py put unpacked/sections/04_volA.img /RO_RES/JPG/SEAL.JPG new.jpg
-./sunp_tool.py repack unpacked -o FPUPDATE.new.DAT
+./sunp_tool.py baseline FPUPDATE.DAT        # pin the image (once)
+# ... drop files into overlay/files/A/..., write overlay/patches/mainfw.patch
+./sunp_tool.py status                       # what would change
+./sunp_tool.py build --verify -o out.DAT    # build, fsck, and check reproducibility
 ```
 
-`unpack` writes `sections/` (the raw blobs), `files/A` and `files/B` (extracted
-trees), and `manifest.json` (offsets, per-section SHA-256, disk descriptors,
-preserved-file list). It then repacks in memory and asserts the result is
-byte-identical to the input.
+`build` refuses to run if the baseline image doesn't hash to the pinned value,
+verifies every carved section against its recorded hash, verifies each patch's
+expected bytes before writing, runs `fsck` on the resulting volumes, and with
+`--verify` builds twice and compares. An empty overlay reproduces the baseline
+byte-for-byte.
 
-> `files/` is a **read-only convenience copy**. `repack` builds from
-> `sections/` only — edits made under `files/` are ignored. Use `put` to change
-> a volume's contents.
+## Commands
+
+```
+info    IMG                 parse and print the container layout
+unpack  IMG [-o DIR]        split into sections + extract both FAT volumes
+repack  DIR [-o IMG]        rebuild from an unpacked dir, recomputing offsets
+baseline IMG                pin an image as the build baseline
+status                      show what overlay/ changes vs the baseline
+build   [--verify] [-o IMG] baseline image + overlay/ -> modified image
+ls      VOL                 list a FAT volume image
+get     VOL PATH DST        copy a file out
+put     VOL PATH SRC        replace or add a file
+rm      VOL PATH            delete a file
+mkdir   VOL PATH            create a directory
+fsck    IMG|VOL             check FAT consistency
+```
+
+`unpack` is for exploration: it writes `sections/` (raw blobs), `files/A` and
+`files/B` (extracted trees), and `manifest.json`, then repacks in memory and
+asserts the result is byte-identical to the input.
+
+> Under `unpack`, `files/` is a **reference copy** — `repack` builds from
+> `sections/` only, so edits there are ignored. Use `put`/`rm` on a section
+> image, or the overlay workflow.
 
 Python 3.8+, no dependencies.
 
@@ -90,8 +113,9 @@ Sections tile the file exactly — there is no padding and no gap.
 ### HDR 1 — partition sizes
 
 Magic `SUNP BURN HDR 1\0`. Mostly zero. `+0x74` and `+0x78` hold the byte sizes
-of disk A and disk B. `+0x20` = 5, `+0x40` = `0xFFFFFFFF`, `+0x80` = `+0x90` =
-1; purpose not established.
+of disk A and disk B (stride 4 per disk, though only two disks are attested).
+`+0x20` = 5, `+0x40` = `0xFFFFFFFF`, `+0x80` = `+0x90` = 1; purpose not
+established.
 
 ### HDR 2 — disk descriptors
 
@@ -125,8 +149,21 @@ flash (NAND reserved-block headers, FW0/FW1 areas, DRAM PARA), not to
 `FPUPDATE.DAT`. The updater validates only: the magic string, a
 `SD_BRN_PREFIX` / `SECRET_PATTERN` project tag, a version comparison, and a
 read-back verify after each write. So a repack only has to get the offsets
-right — which is what `repack` recomputes (header pointers, HDR 1 disk sizes,
+right — which is what the tool recomputes (header pointers, HDR 1 disk sizes,
 and the XOR'd offset/size pairs in HDR 2).
+
+### FAT quirks in the vendor volumes
+
+Both volumes declare two FATs but **only FAT copy 0 is populated** — copy 1
+holds just the media-descriptor signature and is otherwise zeroed, so the
+camera evidently reads copy 0 only. All directory entries have zero timestamps
+and zero NT case flags; mixed-case and long names use proper LFN chains with
+`~1` short names.
+
+The tool follows whatever convention a volume already uses: it maintains a
+spare FAT copy only if that copy currently mirrors copy 0, and it writes zero
+timestamps. That keeps a modified image as close to the known-good baseline as
+possible, and makes builds deterministic.
 
 ## Load addresses
 
@@ -164,16 +201,27 @@ vendor-request ISP path (`usbVNDRReq*`) for raw flash read/write.
 
 ## Status and caveats
 
-- Round-trip of an untouched image is byte-identical.
-- `put` is exercised on FAT16 grow/shrink and FAT12 grow, with every other file
-  in both volumes verified unchanged afterwards, and the written file read back
-  before the image is committed to disk.
-- `put` can only **replace** existing files — no add, delete or rename.
-- Only FAT12/FAT16 and exactly two disk images are handled. The firmware's own
-  `fmt` command advertises FAT32 and exFAT, so other models in this family may
-  not parse.
-- **Flashing a modified image can brick the camera.** Whether the ISP loader can
-  recover a corrupt main firmware has not been established. Take a full flash
-  backup over the USB vendor ISP path first.
+Verified against the baseline image:
+
+- Round-trip of an untouched image is byte-identical, and an empty overlay
+  builds back to the baseline SHA-256.
+- Replace, add, delete and mkdir are exercised on both FAT16 and FAT12, with
+  every untouched file in both volumes confirmed byte-identical afterwards.
+- Results cross-checked against an independent FAT implementation: the built
+  volumes mount under macOS, long names read back correctly, and `fsck_msdos`
+  reports no errors.
+
+Known limits:
+
+- No rename; no recursive directory delete.
+- FAT12/FAT16 only. The firmware's own `fmt` command advertises FAT32 and
+  exFAT, so other models in this family may not parse.
+- Patches are fixed-length in-place edits. Changing a section's size would
+  shift everything after it, which the container header handles, but absolute
+  addresses inside the MIPS firmware would not survive it.
+- **Flashing a modified image can brick the camera.** Nothing here has been
+  tested on hardware. Whether the ISP loader can recover a corrupt main
+  firmware has not been established — take a full flash backup over the USB
+  vendor ISP path first.
 
 Not affiliated with SeaLife, iCatch, or any vendor named here.
