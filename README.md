@@ -1,8 +1,17 @@
 # SeaLife DC2000 firmware tooling
 
-`sunp_tool.py` unpacks, repacks and patches iCatch **"SUNP BURN FILE"** camera
-firmware images — the `FPUPDATE.DAT` files these cameras read off an SD card to
-update themselves.
+Three tools for iCatch **"SUNP BURN FILE"** camera firmware — the
+`FPUPDATE.DAT` files these cameras read off an SD card to update themselves.
+
+| Tool | Scope |
+|---|---|
+| [`sunp_tool.py`](sunp_tool.py) | The container: unpack, repack, FAT volumes, and a baseline+overlay build workflow |
+| [`sunp_assets.py`](sunp_assets.py) | The resources: `FIF1` archives, sprite sheets, string tables, record wrappers |
+| [`sunp_code.py`](sunp_code.py) | The MIPS blobs: cross-references, disassembly, `gp`-relative globals |
+
+Findings from reading the code — the storage stack, SD bus speed, the video
+encoder, and what is actually tunable — are in
+[docs/firmware-internals.md](docs/firmware-internals.md).
 
 Developed against the SeaLife DC2000 image
 `sha256:9beffb33d8b930da160aeb5443b94089881d97128da2d17402b4edb3afbe61ed`
@@ -61,6 +70,17 @@ fsck    IMG|VOL             check FAT consistency
 `unpack` is for exploration: it writes `sections/` (raw blobs), `files/A` and
 `files/B` (extracted trees), and `manifest.json`, then repacks in memory and
 asserts the result is byte-identical to the input.
+
+Reading the code (`sunp_code.py`):
+
+```
+xref  SECTION (--string S | --addr VA)   find code that references it
+dis   SECTION --addr VA [--count N]      disassemble, annotating string refs
+gp    SECTION --offset OFF               find accesses to a gp-relative global
+```
+
+`xref` and `gp` are pure struct parsing. `dis` needs capstone:
+`python3 -m venv /tmp/capenv && /tmp/capenv/bin/pip install capstone`.
 
 > Under `unpack`, `files/` is a **reference copy** — `repack` builds from
 > `sections/` only, so edits there are ignored. Use `put`/`rm` on a section
