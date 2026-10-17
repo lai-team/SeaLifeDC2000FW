@@ -1,0 +1,17 @@
+# Main firmware patches for v1.10 (wifi-key-iso).
+# See docs/firmware-internals.md "Key dispatch" for the addresses used here.
+
+# Version 1.09 -> 1.10.
+# Card-update string read by the updater, "v0x01.0x09.0x00" -> "v0x01.0x10.0x00".
+0x00000adb: 30 78 30 39 -> 30 78 31 30
+# App_PreBootProc @0x801c5810: running minor/sub version, addiu v1,zero,0x0900 -> 0x1000.
+0x001c5810: 00 09 03 24 -> 00 10 03 24
+
+# Wi-Fi key -> ISO menu when the phone app is not connected.
+# Rewrites the MSG_KEY_WIFI case of ProcessDialModeChange (0x8040e434-0x8040e490):
+#   busy check / close function OSD as before, then
+#   app connected     -> jal ViewMenu_WiFiAutoSendMenuCreate (0x803d5610), return
+#   app not connected -> jal View_ShortcutFunc(5 = ISO, 0) (0x803b6c70), return
+# The Auto Send tail call becomes jal + j 0x8040eb18 to free the slots. No code
+# outside this range branches into it.
+0x0040e434: ad 80 02 3c 48 99 42 8c 1d 01 43 90 01 00 02 24 b7 01 62 14 1c 00 b2 8f 76 f3 07 0c 00 0c 04 24 b0 01 40 14 ab 80 02 3c 1c 7c 42 8c 00 00 42 8c 00 04 42 30 04 00 40 10 24 00 bf 8f 16 c2 0e 0c 21 20 00 00 24 00 bf 8f 20 00 b3 8f 1c 00 b2 8f 18 00 b1 8f 14 00 b0 8f 84 55 0f 08 28 00 bd 27 -> 76 f3 07 0c 00 0c 04 24 b6 01 40 14 ab 80 02 3c 1c 7c 42 8c 00 00 42 8c 00 04 42 30 03 00 40 10 00 00 00 00 16 c2 0e 0c 21 20 00 00 ad 80 02 3c 48 99 42 8c 1d 01 43 90 01 00 02 24 05 00 62 14 05 00 04 24 84 55 0f 0c 00 00 00 00 c6 3a 10 08 00 00 00 00 1c db 0e 0c 21 28 00 00 c6 3a 10 08

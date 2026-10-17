@@ -13,3 +13,6 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# Packaged firmware builds (contain the vendor image)
+dist/
