@@ -50,6 +50,18 @@ expected bytes before writing, runs `fsck` on the resulting volumes, and with
 `--verify` builds twice and compares. An empty overlay reproduces the baseline
 byte-for-byte.
 
+Before writing anything, `build` runs the same pre-flight checks as
+`check IMG`. The output is not written if any of these fail:
+- the header balancing checksum (the file word sum must be 0);
+- the firmware ID string, parsed the way the camera's updater does;
+- section layout identical to the baseline;
+- the flasher, HDR 1/2/3 and the DRAM-timing sections byte-identical to the
+  baseline;
+- the main-firmware reset and startup region (`0x0`–`0xac0`) untouched.
+
+It also warns if the version string and the running-version constant
+disagree, and lists every main-firmware byte range that changed.
+
 ## Commands
 
 ```
@@ -59,6 +71,7 @@ repack  DIR [-o IMG]        rebuild from an unpacked dir, recomputing offsets
 baseline IMG                pin an image as the build baseline
 status                      show what overlay/ changes vs the baseline
 build   [--verify] [-o IMG] baseline image + overlay/ -> modified image
+check   IMG                 pre-flight safety checks (run automatically by build)
 ls      VOL                 list a FAT volume image
 get     VOL PATH DST        copy a file out
 put     VOL PATH SRC        replace or add a file
@@ -306,14 +319,32 @@ A:\RO_RES\LSC.BIN
 
 ### Integrity
 
-There is **no encryption, no signature and no container-level checksum**. Every
-`checkSum`/CRC string in the ISP loader belongs to structures it *writes* to
-flash (NAND reserved-block headers, FW0/FW1 areas, DRAM PARA), not to
-`FPUPDATE.DAT`. The updater validates only: the magic string, a
-`SD_BRN_PREFIX` / `SECRET_PATTERN` project tag, a version comparison, and a
-read-back verify after each write. So a repack only has to get the offsets
-right — which is what the tool recomputes (header pointers, HDR 1 disk sizes,
-and the XOR'd offset/size pairs in HDR 2).
+There is **no encryption and no signature**, but there **is** one
+container-level checksum. The u32 at header `+0x1fc` is a balancing word: the
+little-endian u32 sum of every full word in the file (the 2-byte tail is
+ignored) is exactly zero. The vendor image sums to `0x00000000`, which cannot
+be chance. No code that checks it was found in the ISP loader or in the main
+firmware's update entry (`0x804dfe1c`). Something else may check it, such as
+the boot ROM or the vendor PC tool, so `assemble()` always recomputes it and
+`sunp_tool.py check` fails any image that doesn't sum to zero.
+
+The other `checkSum`/CRC strings in the ISP loader belong to structures it
+*writes* to flash (SPI/NAND reserved-block headers, eMMC boot areas, DRAM
+PARA). Those checksums are computed from the data being written, not taken
+from `FPUPDATE.DAT`. The firmware is written by `spiFwWrite` and then read
+back and compared (`Fw verify...`).
+
+The camera-side updater (`0x80431180`) validates:
+- the magic string;
+- the `VQSD_BRN:` prefix and 7-character project tag (`VSF010W`);
+- `sscanf("v0x%X.0x%X")`, which gives card version `(major << 16) | minor`.
+
+The only other gate is low battery. It shows both versions and then asks; it
+does **not** require the card version to be newer, so downgrades are allowed.
+
+A repack therefore has to get the offsets right and rebalance the checksum.
+The tool recomputes header pointers, HDR 1 disk sizes, the XOR'd offset/size
+pairs in HDR 2, and `+0x1fc`.
 
 ### FAT quirks in the vendor volumes
 

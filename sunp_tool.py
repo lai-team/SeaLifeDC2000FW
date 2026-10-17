@@ -3,8 +3,10 @@
 sunp_tool.py - unpack / repack / patch iCatch "SUNP BURN FILE" camera firmware.
 
 Developed against the SeaLife DC2000 FPUPDATE.DAT (iCatch CA6350A / V35,
-project VSF010W v1.09.00).  The container has no checksum or signature over
-itself, so a repack only has to get the section offsets right.
+project VSF010W v1.09.00).  There is no signature.  The only integrity field
+is a balancing word at header +0x1fc chosen so that the little-endian u32 sum
+of the whole file (trailing partial word ignored) is zero; assemble()
+recomputes it, so a repack only has to get the section offsets right.
 
 Two workflows:
 
@@ -57,6 +59,21 @@ F_TOTAL, F_HDR1, F_HDR2, F_MAINFW, F_UNK20, F_HDR3, F_DRAMPAR = (
 
 HDR1_DISKSIZE0 = 0x74    # HDR 1 mirrors each disk's size, stride 4
 
+# Balancing checksum: u32 at header +0x1fc makes the LE u32 sum of the whole
+# file zero. Verified against the vendor image (sum of all full words == 0).
+F_CKSUM = 0x1FC
+
+# Sections a firmware mod has no business touching: the flasher itself, the
+# partition/backup headers, and the DRAM timing blobs. preflight() fails if
+# any of them differ from the baseline.
+FROZEN_ROLES = ("dramcode", "hdr1", "hdr2", "hdr3", "drampar")
+# Main-firmware bytes that must never change: reset/exception vectors and
+# startup code before the firmware ID string.
+MAINFW_FROZEN = (0x0, 0xAC0)
+# DC2000-specific: App_PreBootProc loads the running minor/sub version with
+# `addiu $v1, $zero, 0xMMSS` here; it should agree with the firmware ID string.
+MAINFW_VERSION_INSN = 0x1C5810
+
 BASELINE_JSON = "baseline.json"
 OVERLAY_DIR = "overlay"
 MANIFEST_JSON = "manifest.json"
@@ -68,6 +85,18 @@ ATTR_RO, ATTR_HIDDEN, ATTR_SYS, ATTR_VOLID, ATTR_DIR, ATTR_ARCHIVE = (
 ATTR_LFN = 0x0F
 SFN_INVALID = set('"*/:<>?\\|+,;=[] ')
 FREE_SLOT, END_SLOT = 0xE5, 0x00
+
+
+def wordsum(data):
+    """LE u32 sum of every full word, mod 2**32."""
+    n = len(data) // 4
+    return sum(struct.unpack_from(f"<{n}I", data)) & 0xFFFFFFFF
+
+
+def fix_checksum(buf):
+    """Set the header balancing word so wordsum(buf) == 0. Mutates buf."""
+    struct.pack_into("<I", buf, F_CKSUM, 0)
+    struct.pack_into("<I", buf, F_CKSUM, (-wordsum(buf)) & 0xFFFFFFFF)
 
 
 def sha256(b):
@@ -678,7 +707,9 @@ def assemble(sections):
             warn(f"disk {i}: HDR1 size field offset 0x{fo:x} is extrapolated")
         struct.pack_into("<I", h1, fo, len(b))
 
-    return b"".join(bytes(b) for b in blobs)
+    out = bytearray(b"".join(bytes(b) for b in blobs))
+    fix_checksum(out)
+    return bytes(out)
 
 
 def carve(data, section_meta):
@@ -908,6 +939,147 @@ def apply_overlay(secs, ops, log=None):
 # commands
 # --------------------------------------------------------------------------
 
+
+# --------------------------------------------------------------------------
+# pre-flight checks
+# --------------------------------------------------------------------------
+
+FWID_RE = re.compile(rb"VQSD_BRN:(.{7}) v0x([0-9A-Fa-f]+)\.0x([0-9A-Fa-f]+)"
+                     rb"(?:\.0x([0-9A-Fa-f]+))?@([^\x00]*)")
+
+
+def parse_fwid(data, c):
+    """Mirror the camera updater: find VQSD_BRN:, 7-char project, then
+    sscanf("v0x%X.0x%X") -> card version (major << 16) | minor."""
+    i = data.find(b"VQSD_BRN:", c.off_mainfw, c.off_hdr3)
+    if i < 0:
+        return None
+    m = FWID_RE.match(data, i)
+    if not m:
+        return {"offset": i, "ok": False}
+    sub = int(m.group(4), 16) if m.group(4) else 0
+    return {"offset": i, "ok": True, "project": m.group(1).decode("latin1"),
+            "major": int(m.group(2), 16), "minor": int(m.group(3), 16),
+            "sub": sub, "hw": m.group(5).decode("latin1")}
+
+
+def diff_ranges(a, b):
+    """[(start, end)] of differing bytes between equal-length a and b."""
+    out, i, n = [], 0, min(len(a), len(b))
+    while i < n:
+        if a[i] != b[i]:
+            j = i
+            while j < n and a[j] != b[j]:
+                j += 1
+            out.append((i, j))
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def preflight(img, bl=None, base=None):
+    """Checks an image before it goes anywhere near a camera.
+
+    Returns [(level, message)] with level "ok", "warn" or "FAIL". With a
+    baseline (and its image bytes) it also checks that nothing outside the
+    intended edits moved."""
+    res = []
+    add = lambda lvl, msg: res.append((lvl, msg))
+    c = Container(img)
+
+    add("ok" if c.total == len(img) else "FAIL",
+        f"header size field 0x{c.total:x} vs file 0x{len(img):x}")
+    probs = c.check_contiguous()
+    add("ok" if not probs else "FAIL",
+        "layout contiguous" if not probs else "layout: " + "; ".join(probs))
+    ws = wordsum(img)
+    add("ok" if ws == 0 else "FAIL",
+        f"balancing checksum (+0x{F_CKSUM:x}=0x{u32(img, F_CKSUM):08x}): "
+        f"file word sum 0x{ws:08x}" + ("" if ws == 0 else " (must be 0)"))
+
+    fid = parse_fwid(img, c)
+    if not fid or not fid["ok"]:
+        add("FAIL", "firmware ID string missing or unparseable "
+                    "(updater would reject the card)")
+    else:
+        add("ok", f"firmware ID: project {fid['project']} "
+                  f"v{fid['major']:X}.{fid['minor']:02X} (sub {fid['sub']:X}) "
+                  f"@{fid['hw']}, card version 0x"
+                  f"{(fid['major'] << 16) | fid['minor']:08x}")
+
+    mf = next(s for s in c.sections() if s["role"] == "mainfw")
+    o = mf["offset"] + MAINFW_VERSION_INSN
+    w = u32(img, o)
+    if fid and fid["ok"] and (w & 0xFFFF0000) == 0x24030000:  # addiu v1,zero,imm
+        imm = w & 0xFFFF
+        good = (imm >> 8, imm & 0xFF) == (fid["minor"], fid["sub"])
+        add("ok" if good else "warn",
+            f"running-version constant 0x{imm:04x} "
+            + ("matches" if good else "disagrees with") + " the firmware ID")
+
+    if bl is None:
+        return res
+
+    add("ok" if len(img) == bl["size"] else "FAIL",
+        f"size {len(img)} vs baseline {bl['size']}")
+    cur = c.sections()
+    same_layout = [(s["name"], s["offset"], s["length"]) for s in cur] == \
+        [(s["name"], s["offset"], s["length"]) for s in bl["sections"]]
+    add("ok" if same_layout else "FAIL",
+        "section layout identical to baseline" if same_layout
+        else "section layout differs from baseline")
+    if not same_layout:
+        return res
+
+    for s, rec in zip(carve(img, cur), bl["sections"]):
+        changed = sha256(s["data"]) != rec["sha256"]
+        if s["role"] in FROZEN_ROLES:
+            add("FAIL" if changed else "ok",
+                f"{s['name']} " + ("MODIFIED" if changed else "untouched"))
+        elif s["role"] == "header" and base is not None:
+            d = [r for r in diff_ranges(s["data"], base[:HEADER_LEN])
+                 if not (r[0] >= F_CKSUM and r[1] <= F_CKSUM + 4)]
+            add("ok" if not d else "FAIL",
+                "header matches baseline apart from the checksum word" if not d
+                else f"header changed at {d}")
+        elif changed:
+            add("ok", f"{s['name']} modified (expected for overlay edits)")
+
+    if base is not None:
+        b = base[mf["offset"]:mf["offset"] + mf["length"]]
+        a = img[mf["offset"]:mf["offset"] + mf["length"]]
+        rs = diff_ranges(a, b)
+        lo, hi = MAINFW_FROZEN
+        bad = [r for r in rs if r[0] < hi and r[1] > lo]
+        add("FAIL" if bad else "ok",
+            f"main firmware startup region 0x{lo:x}-0x{hi:x} "
+            + (f"MODIFIED at {bad}" if bad else "untouched"))
+        if rs:
+            add("ok", "main firmware edits: " + ", ".join(
+                f"0x{s:x}+{e - s}" for s, e in rs))
+    return res
+
+
+def report_preflight(res):
+    for lvl, msg in res:
+        print(f"  [{lvl:>4}] {msg}")
+    return not any(lvl == "FAIL" for lvl, _ in res)
+
+
+def cmd_check(args):
+    img = open(args.image, "rb").read()
+    bl = base = None
+    if not args.no_baseline and os.path.exists(args.baseline):
+        bl = load_baseline(args.baseline)
+        base = read_baseline_image(bl, args.base_image)
+    print(f"{args.image}: pre-flight"
+          + ("" if bl else " (no baseline comparison)"))
+    if not report_preflight(preflight(img, bl, base)):
+        die("pre-flight FAILED - do not flash this image")
+    print("pre-flight passed")
+
+
 def cmd_info(args):
     data = open(args.image, "rb").read()
     c = Container(data)
@@ -916,6 +1088,9 @@ def cmd_info(args):
                        ("build stamp", c.build_stamp())):
         if val:
             print(f"{label} : {val}")
+    ws = wordsum(data)
+    print(f"checksum    : +0x{F_CKSUM:x}=0x{u32(data, F_CKSUM):08x}, "
+          f"file word sum 0x{ws:08x} ({'OK' if ws == 0 else 'BAD'})")
     print()
     print(f"{'section':<18}{'role':<10}{'offset':>12}{'length':>12}")
     for s in c.sections():
@@ -1099,6 +1274,9 @@ def cmd_build(args):
         print("  " + line)
     if not log:
         print("  (empty overlay)")
+    print("\npre-flight:")
+    if not report_preflight(preflight(out, bl, data)):
+        die(f"pre-flight FAILED - {args.output} not written")
     open(args.output, "wb").write(out)
     digest = sha256(out)
     print(f"\n{args.output}: {len(out)} bytes  sha256={digest}")
@@ -1238,6 +1416,14 @@ def main():
     p.add_argument("--verify", action="store_true",
                    help="build twice and check the results are identical")
     p.set_defaults(func=cmd_build)
+
+    p = sub.add_parser("check", help="pre-flight safety checks on an image")
+    p.add_argument("image")
+    p.add_argument("--baseline", default=BASELINE_JSON)
+    p.add_argument("--base-image", help="path to the baseline image")
+    p.add_argument("--no-baseline", action="store_true",
+                   help="skip the comparison against the pinned baseline")
+    p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("ls", help="list a FAT volume image")
     p.add_argument("volume")
