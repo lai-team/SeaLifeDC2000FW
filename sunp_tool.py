@@ -73,6 +73,10 @@ MAINFW_FROZEN = (0x0, 0xAC0)
 # DC2000-specific: App_PreBootProc loads the running minor/sub version with
 # `addiu $v1, $zero, 0xMMSS` here; it should agree with the firmware ID string.
 MAINFW_VERSION_INSN = 0x1C5810
+# Second, hard-coded copy of the minor version (`addiu $rt, $zero, minor`):
+# the HCE version getter used by the startup screen, the version string sent
+# to the phone app, and the boot log.
+MAINFW_MINOR_INSNS = (0x1C40C0, 0x1C473C, 0x1C4048)
 
 BASELINE_JSON = "baseline.json"
 OVERLAY_DIR = "overlay"
@@ -1017,6 +1021,16 @@ def preflight(img, bl=None, base=None):
         add("ok" if good else "warn",
             f"running-version constant 0x{imm:04x} "
             + ("matches" if good else "disagrees with") + " the firmware ID")
+        for off in MAINFW_MINOR_INSNS:
+            w = u32(img, mf["offset"] + off)
+            if (w & 0xFFE00000) != 0x24000000:      # addiu $rt, $zero, imm
+                add("warn", f"minor-version insn at mainfw+0x{off:x} not found")
+                continue
+            ok = (w & 0xFFFF) == fid["minor"]
+            add("ok" if ok else "warn",
+                f"hard-coded minor version at mainfw+0x{off:x} = "
+                f"0x{w & 0xFFFF:02x} " + ("matches" if ok else
+                                         "disagrees with") + " the firmware ID")
 
     if bl is None:
         return res

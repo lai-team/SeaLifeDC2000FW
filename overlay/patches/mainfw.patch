@@ -6,6 +6,14 @@
 0x00000adb: 30 78 30 39 -> 30 78 31 30
 # App_PreBootProc @0x801c5810: running minor/sub version, addiu v1,zero,0x0900 -> 0x1000.
 0x001c5810: 00 09 03 24 -> 00 10 03 24
+# The "HCE" version is a second hard-coded copy (major 1, minor 9, sub 0):
+# 0x801c40b0 getter -> startup-screen "v%X.%02X%02X" at bottom right (the
+# version the manual tells users to read), addiu v0,zero,9 -> 0x10.
+0x001c40c0: 09 00 02 24 -> 10 00 02 24
+# 0x801c472c: "%x.%02x%02x" version string reported to the Link123 app, addiu a3,zero,9 -> 0x10.
+0x001c473c: 09 00 07 24 -> 10 00 07 24
+# 0x801c4028: boot log "%s, HCE: v%x.%02x%02x", addiu a3,zero,9 -> 0x10.
+0x001c4048: 09 00 07 24 -> 10 00 07 24
 
 # Wi-Fi key -> ISO menu when the phone app is not connected.
 # Rewrites the MSG_KEY_WIFI case of ProcessDialModeChange (0x8040e434-0x8040e490):

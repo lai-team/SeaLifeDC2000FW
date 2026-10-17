@@ -120,10 +120,12 @@ bitRate:%d KB`. No artificial recording-duration cap was found.
 the UI as "RAW + JPEG"), `ISO_AUTO_MAX`, `AEB_EV`, `VIDEO_STABILIZER`,
 `PRERECORD`, `PANORAMA_DEGREE`, `TIME_LAPSE`.
 
-One caution: string tables contain `ISO 12800` and `ISO 25600` while the menu
-exposes 125–6400. Unused strings are common in these ODM tables — the usable
-range is set by the sensor driver and the ISO-indexed noise-filter tables, not
-by the presence of a string. Do not read that as an unlockable feature.
+The ISO menu has 10 entries: Auto, 125–6400, 12800 and 25600. The builder
+case for it (`0x803d2a08`) creates a 10-item menu. `ISO 12800`/`ISO 25600`
+(UI strings 841–842) and Maximum ISO Auto 3200–12800 (844–846) sit at the end
+of the string table, which fits the manual's note that V1.08 added them. The
+manual lists the same options. An earlier version of this section said the
+menu stopped at 6400; that was wrong.
 
 ## Key dispatch
 
@@ -172,6 +174,15 @@ struct key_name_row {      /* 0x80ac9b3c, 24 rows, no terminator */
 | 22 | `MSG_DEBUGMSG_LENS` | `0xf0000000` | — |
 | 23 | `MSG_ENTER_TEST_MODE` | `0xf2000012` | — |
 
+Not every row is a DC2000 button. The manual lists the physical controls as
+Power, Shutter (half press = `SNAP1`, full = `SNAP2`), Menu, Playback, Movie
+(`VIDEO`), Wireless (`WIFI`), OK (`SET`), the 4-way pad and an 8-position mode
+dial (P, Intelligent Scene, Land Scene, Panorama, M, Underwater, A, S). The
+camera has no zoom lever or lock key, so `TELE`, `WIDE` and `LOCK` appear to be
+platform leftovers. The `MSG_MODEKEY_*` rows (Auto Scene, Program, Scene, Art,
+Burst, Video) don't match this dial either. Digital zoom is driven from
+Up/Down once the Zoom shortcut is enabled.
+
 Release is always press + `0x20` for the physical keys. The ordering of the
 low byte is not the row order (`SNAP2` is `01`, `SNAP1` is `02`), so look IDs
 up in the table rather than deriving them. `MSG_KEY_WATER` exists as a string
@@ -201,13 +212,15 @@ it is the single place where a key gains a camera-wide meaning. For
 ### What the Wi-Fi button does
 
 The Wi-Fi key does **not** switch Wi-Fi on or off. It only does something
-while the Link123 app is connected:
+while the Link123 app is connected. The manual agrees: it calls this the
+"Wireless Auto Send button", tells users not to press it when connecting, and
+describes it only for the app's Camera mode.
 
 | Context | Handler | Effect |
 |---|---|---|
 | Still live view, app connected | `0x8040e35c` | Opens the Auto Send menu |
-| Single-image playback, app connected | `0x8048cc78` → `0x8048de18` | Enters QuickSend mode (`uwMode = 0x1151`), which sends the displayed image |
-| QuickSend | `0x8048fe2c` → `0x804909b0` | Leaves QuickSend |
+| Single-image playback, app connected | `0x8048cc78` → `0x8048de18` | Enters Quick Send mode (`uwMode = 0x1151`), which shows the Quick Send icon. Per the manual, OK then sends the displayed image |
+| Quick Send | `0x8048fe2c` → `0x804909b0` | Leaves Quick Send |
 | "Download GPS Data" Wi-Fi screen | `0x804d3a6c` → `0x804d3e90` | Exits and stops the soft AP (`WifiNetLib_Ap_Disable`) |
 | Factory key test | `0x8045fb04` → `0x80460348` | Registers key bit `0x40000` |
 | Anything else, or app not connected | — | Nothing |
@@ -230,16 +243,22 @@ posted from `ViewCreate` (`0x803b4274`) to resume a pending session.
 
 ### Shortcut menus
 
-The camera menu's "Shortcut" option (UI strings 883–895) assigns one of 11
-functions to a key. The code path is reusable from any key handler:
+The Setup menu's "Shortcut" option (UI strings 883–895) assigns one of 11
+functions to the **OK** button in record mode. The default is Digital Zoom.
+The manual says the shortcut is only available in Program and UW modes; in
+the other dial modes OK opens that mode's own sub-menu. The code path can be
+reused from any key handler:
 
 - **`View_ShortcutFunc(byShortcut)`** (`0x803b6c70`) switches on
   `byShortcut − 1` through the table at `0x80911454`. Each case checks a
   per-mode "allowed" bit in `*[0x80ab7c5c]` and then calls
   `ViewMenuGoSubMenuDirect`. If the bit is clear it does nothing.
-- **`ViewMenuGoSubMenuDirect(byShortcut)`** (`0x803d3a28`) maps the shortcut
-  through a stack table (`nShortcutMenuTbl`) to a view-menu item, opens it
-  with `0x803d39b0`, and sets `uwMode = 0x2100`.
+- **`ViewMenuGoSubMenuDirect(byShortcut)`** (`0x803d3a28`) first calls
+  `0x803d0730`. That sets the menu type `*[0x80ab7c58] + 0x22` to `0x10` and
+  builds the 28-item still menu. It then maps the shortcut through a stack
+  table (`nShortcutMenuTbl`) to a view-menu item, opens it with `0x803d39b0`,
+  and sets `uwMode = 0x2100`. Because the type is forced to `0x10`, the item
+  numbers below hold in every dial mode.
 - The view-menu builder `0x803d21cc` dispatches on that item through a
   28-entry jump table at `0x809149b8`.
 
@@ -260,8 +279,40 @@ functions to a key. The code path is reusable from any key handler:
 Shortcuts 1–3 are handled by dedicated code (cases at `0x803b6d68`,
 `0x803b6db0` and `0x803b6ddc`) instead of a sub-menu, so the menu-item column
 is empty for them. Rows 9–11 have special-case gating that was not decoded.
-The user's choice is stored in `[0x80ab7c60] + 0x3c`. The Up-key handler
-`ViewMainMode_ProcUpKey_VSF010W` (`0x803b64e8`) reads it.
+The manual's list names 10 options plus Off but leaves out AE/AF Lock, which
+it describes separately as a shortcut added in V1.08. With AE/AF Lock that
+gives 11, matching the table.
+
+The user's choice is stored in **`[0x80ab7c60] + 0x3e`**. The view key handler
+reads it and tail-calls `View_ShortcutFunc(+0x3e, 0)` (`0x803baba0` →
+`0x803bafd0`). `[0x80ab7c60] + 0x3c` is `nAsmAdjusting`, which is non-zero
+while aperture or shutter is being adjusted in A/S/M. Both names come from the
+debug print in `ViewMainMode_ProcUpKey_VSF010W` (`0x803b64e8`). An earlier
+version of this section swapped the two fields.
+
+**Where ISO is allowed.** `0x8038d924(viewMode, scene, mask)` recomputes the
+mask whenever the mode changes. Emulating it with Unicorn for view modes 0–15
+and scenes 0–63, the ISO bit (`[0] & 0x04`) is set for view modes 4–8, depends
+on the scene in mode 1, and is clear everywhere else. The bit never depends on
+the mask's previous value. Modes 4–6 are the A/S/M modes: the view key handler
+routes keys to the aperture/shutter adjuster when `gsUI + 0x766` is 4–6 and
+`nAsmAdjusting` is set. Matching the manual's per-mode menu access, 7–8 are
+probably P and UW, and 1 Land Scene. That mapping is inferred, not read from
+a table.
+
+### Version numbers
+
+The version is stored in three independent places, all as BCD-style hex
+(`1.09` = major `0x01`, minor `0x09`, sub `0x00`):
+
+| Copy | Where | Used by |
+|---|---|---|
+| Firmware ID string `v0x01.0x09.0x00` | mainfw `+0xac4` | the card updater, via `sscanf("v0x%X.0x%X")` |
+| `addiu $v1, $zero, 0x0900` stored to `0x80c6118c` (major from `App_PreBootProc`'s argument) | `0x801c5810` | update-screen "current version" (`%X.%02X`), photo EXIF Software tag (`%x.%04x`), USB/PTP DeviceInfo, calibration screen |
+| HCE version: literal `1, 9, 0` | `0x801c40b0` / `0x801c472c` / `0x801c4028` | the **startup-screen** `v%X.%02X%02X` at bottom right (the place the manual tells users to read the version), the version string sent to the Link123 app, and the boot log |
+
+A version bump has to change all of them. `sunp_tool.py check` checks that
+the second and third copies agree with the string.
 
 ## What is and is not tunable
 

@@ -59,8 +59,11 @@ Before writing anything, `build` runs the same pre-flight checks as
   baseline;
 - the main-firmware reset and startup region (`0x0`–`0xac0`) untouched.
 
-It also warns if the version string and the running-version constant
-disagree, and lists every main-firmware byte range that changed.
+It also warns if the version string disagrees with either hard-coded copy of
+the version (the running-version constant, or the HCE version shown on the
+startup screen and sent to the app; see "Version numbers" in
+[docs/firmware-internals.md](docs/firmware-internals.md)). Finally it lists
+every main-firmware byte range that changed.
 
 ## Commands
 
